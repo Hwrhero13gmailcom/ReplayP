@@ -377,7 +377,11 @@ void Playback::ProcessStart(GameplayModifiers*& modifiers, PracticeSettings*& pr
     auto roomAdjust = UnityEngine::Object::FindObjectOfType<VRCenterAdjust*>(true);
     auto oldPosAdj = roomAdjust->_settingsManager->settings.room.center;
     auto oldRotAdj = roomAdjust->_settingsManager->settings.room.rotation;
+    // prevent it from applying the reset to the menu
+    auto applitcator = roomAdjust->_settingsApplicator;
+    roomAdjust->_settingsApplicator = nullptr;
     roomAdjust->ResetRoom();
+    roomAdjust->_settingsApplicator = applitcator;
 
     auto resetChanges = [player, leftHanded, roomAdjust, oldPosAdj, oldRotAdj]() {
         player->_leftHanded = leftHanded;
