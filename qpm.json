@@ -43,6 +43,7 @@
         "pwsh ./scripts/pull-tombstone.ps1 -analyze"
       ]
     },
+    "ndk": "^28.2.13676358",
     "qmodIncludeDirs": [],
     "qmodIncludeFiles": [],
     "qmodOutput": null
