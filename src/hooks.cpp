@@ -359,9 +359,8 @@ void Recorder::OnLevelEnd(bool quit, bool failed, float failTime) {
 }
 
 std::string Recorder::SaveReplay() {
-    // modInfo is defined in main.cpp
-    extern modloader::ModInfo modInfo;
-    static std::string replayDir = getDataDir("bl") + "replays/";
+    // BeatLeader stores replays here on Quest
+    static std::string replayDir = "/sdcard/ModData/com.beatgames.beatsaber/Mods/bl/replays/";
 
     if (!std::filesystem::exists(replayDir)) {
         std::error_code ec;
