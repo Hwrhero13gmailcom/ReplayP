@@ -20,11 +20,16 @@
 #include "GlobalNamespace/SinglePlayerLevelSelectionFlowCoordinator.hpp"
 #include "System/Collections/Generic/HashSet_1.hpp"
 #include "UnityEngine/Renderer.hpp"
+#include "UnityEngine/Resources.hpp"
+#include "UnityEngine/Time.hpp"
 #include "camera.hpp"
 #include "config.hpp"
 #include "manager.hpp"
+#include "metacore/shared/internals.hpp"
+#include "metacore/shared/songs.hpp"
 #include "pause.hpp"
 #include "playback.hpp"
+#include "recorder.hpp"
 
 using namespace GlobalNamespace;
 using namespace il2cpp_utils::il2cpp_type_check;
@@ -66,8 +71,18 @@ MAKE_AUTO_HOOK_MATCH(
     UnityEngine::Quaternion orientation,
     UnityEngine::Vector3 cutDirVec
 ) {
-    if (!Playback::DisableRealEvent(true))
+    if (!Playback::DisableRealEvent(true)) {
+        if (Recorder::IsRecording()) {
+            NoteCutInfo cutInfo = NoteCutInfo(
+                self->_noteTransform, false, false, false, false,
+                saber->bladeSpeedForLogic, saber->bladeTopPos - saber->bladeBottomPos,
+                (int) saber->saberType, 0, 0, cutPoint,
+                UnityEngine::Vector3::get_up(), 0, 0, 0, 0, saber
+            );
+            Recorder::OnBombCut(self, cutInfo);
+        }
         BombNoteController_HandleWasCutBySaber(self, saber, cutPoint, orientation, cutDirVec);
+    }
 }
 
 // disable real note cuts
@@ -82,8 +97,29 @@ MAKE_AUTO_HOOK_MATCH(
     UnityEngine::Vector3 cutDirVec,
     bool allowBadCut
 ) {
-    if (!Playback::DisableRealEvent(allowBadCut && IsBadCut(self, saber, cutDirVec, self->_cutAngleTolerance)))
+    if (!Playback::DisableRealEvent(allowBadCut && IsBadCut(self, saber, cutDirVec, self->_cutAngleTolerance))) {
+        if (Recorder::IsRecording()) {
+            // Build a NoteCutInfo so we can record it before the game processes it
+            bool dirOK, speedOK, saberTypeOK;
+            float cutDirDeviation, cutDirAngle;
+            NoteBasicCutInfoHelper::GetBasicCutInfo(
+                self->_noteTransform, self->_noteData->colorType, self->_noteData->cutDirection,
+                saber->saberType, saber->bladeSpeedForLogic, cutDirVec, self->_cutAngleTolerance,
+                byref(dirOK), byref(speedOK), byref(saberTypeOK), byref(cutDirDeviation), byref(cutDirAngle)
+            );
+            NoteCutInfo cutInfo = NoteCutInfo(
+                self->_noteTransform, speedOK, dirOK, saberTypeOK, false,
+                saber->bladeSpeedForLogic, cutDirVec,
+                (int) saber->saberType,
+                self->_noteData->time - MetaCore::Internals::audioTimeSyncController->songTime,
+                cutDirDeviation, cutPoint,
+                UnityEngine::Vector3::get_up(),
+                0, cutDirAngle, 0, 0, saber
+            );
+            Recorder::OnNoteCut(self, cutInfo);
+        }
         GameNoteController_HandleCut(self, saber, cutPoint, orientation, cutDirVec, allowBadCut);
+    }
 }
 
 // disable real chain cuts
@@ -106,8 +142,11 @@ MAKE_AUTO_HOOK_MATCH(
 MAKE_AUTO_HOOK_MATCH(
     NoteController_HandleNoteDidPassMissedMarkerEvent, &NoteController::HandleNoteDidPassMissedMarkerEvent, void, NoteController* self
 ) {
-    if (!Playback::DisableRealEvent(true))
+    if (!Playback::DisableRealEvent(true)) {
+        if (Recorder::IsRecording())
+            Recorder::OnNoteMiss(self);
         NoteController_HandleNoteDidPassMissedMarkerEvent(self);
+    }
 }
 
 // disable real obstacle interactions
@@ -232,6 +271,13 @@ MAKE_AUTO_HOOK_MATCH(
     System::Nullable_1<RecordingToolManager::SetupData> f19
 ) {
     Playback::ProcessStart(f8, f10, f9);
+
+    // If this is a practice mode launch (not a replay), start recording
+    if (!Manager::Replaying() && f10 != nullptr) {
+        auto map = MetaCore::Songs::GetSelectedKey();
+        Recorder::OnPracticeStart(f10, (std::string) map.levelId);
+    }
+
     MenuTransitionsHelper_StartStandardLevel(self, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19);
 }
 
@@ -394,9 +440,31 @@ MAKE_AUTO_HOOK_MATCH(
         SinglePlayerLevelSelectionFlowCoordinator_BackButtonWasPressed(self, topViewController);
 }
 
-// update camera view
+// update camera view + record poses
 MAKE_AUTO_HOOK_MATCH(PlayerTransforms_Update, &PlayerTransforms::Update, void, PlayerTransforms* self) {
     Camera::UpdateCamera(self);
+
+    if (Recorder::IsRecording() && self->_headTransform && MetaCore::Internals::audioTimeSyncController) {
+        float songTime = MetaCore::Internals::audioTimeSyncController->songTime;
+        int fps = UnityEngine::Time::get_deltaTime() > 0
+            ? (int)(1.0f / UnityEngine::Time::get_deltaTime())
+            : 60;
+
+        // Find left and right sabers
+        Saber* leftSaber = nullptr;
+        Saber* rightSaber = nullptr;
+        auto sabers = UnityEngine::Resources::FindObjectsOfTypeAll<Saber*>();
+        for (int i = 0; i < sabers->Length(); i++) {
+            auto s = sabers->get(i);
+            if (!s->isActiveAndEnabled) continue;
+            if (s->saberType == SaberType::SaberA) leftSaber  = s;
+            else if (s->saberType == SaberType::SaberB) rightSaber = s;
+        }
+
+        if (leftSaber && rightSaber)
+            Recorder::OnUpdate(self->_headTransform, leftSaber, rightSaber, songTime, fps);
+    }
+
     PlayerTransforms_Update(self);
 }
 
