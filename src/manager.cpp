@@ -345,10 +345,16 @@ ON_EVENT(MetaCore::Events::GameplaySceneEnded) {
 
     // Finalize practice recording if active
     if (Recorder::IsRecording()) {
-        bool failed = MetaCore::Internals::health == 0 && !MetaCore::Internals::mapWasQuit;
-        float failTime = failed ? (MetaCore::Internals::audioTimeSyncController
-            ? MetaCore::Internals::audioTimeSyncController->songTime : 0) : -1;
         bool wasQuit = MetaCore::Internals::mapWasQuit;
+        bool failed = false;
+        float failTime = -1;
+        try {
+            failed = MetaCore::Internals::health == 0 && !wasQuit;
+            if (failed && MetaCore::Internals::audioTimeSyncController)
+                failTime = MetaCore::Internals::audioTimeSyncController->songTime;
+        } catch (...) {
+            logger.error("Recorder: exception reading end state");
+        }
         std::thread([wasQuit, failed, failTime]() {
             Recorder::OnLevelEnd(wasQuit, failed, failTime);
         }).detach();
