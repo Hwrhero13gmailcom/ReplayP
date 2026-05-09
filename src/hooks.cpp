@@ -1,583 +1,389 @@
-#include "hooks.hpp"
-
-#include <GLES3/gl3.h>
-
-#include "GlobalNamespace/BeatmapObjectManager.hpp"
-#include "GlobalNamespace/BombNoteController.hpp"
-#include "GlobalNamespace/BurstSliderGameNoteController.hpp"
-#include "GlobalNamespace/ConditionalActivation.hpp"
-#include "GlobalNamespace/DeactivateVRControllersOnFocusCapture.hpp"
-#include "GlobalNamespace/GameNoteController.hpp"
-#include "GlobalNamespace/GameSongController.hpp"
-#include "GlobalNamespace/LevelCompletionResults.hpp"
-#include "GlobalNamespace/ListExtensions.hpp"
-#include "GlobalNamespace/MenuTransitionsHelper.hpp"
-#include "GlobalNamespace/NoteBasicCutInfoHelper.hpp"
-#include "GlobalNamespace/ObstacleMaterialSetter.hpp"
-#include "GlobalNamespace/PauseController.hpp"
-#include "GlobalNamespace/PlayerHeadAndObstacleInteraction.hpp"
-#include "GlobalNamespace/ShockwaveEffect.hpp"
-#include "GlobalNamespace/SinglePlayerLevelSelectionFlowCoordinator.hpp"
-#include "System/Collections/Generic/HashSet_1.hpp"
-#include "UnityEngine/Renderer.hpp"
-#include "UnityEngine/Resources.hpp"
-#include "UnityEngine/Time.hpp"
-#include "camera.hpp"
-#include "config.hpp"
-#include "manager.hpp"
-#include "metacore/shared/internals.hpp"
-#include "metacore/shared/songs.hpp"
-#include "pause.hpp"
-#include "playback.hpp"
 #include "recorder.hpp"
 
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+
+#include "GlobalNamespace/NoteController.hpp"
+#include "GlobalNamespace/NoteData.hpp"
+#include "GlobalNamespace/NoteCutInfo.hpp"
+#include "GlobalNamespace/PracticeSettings.hpp"
+#include "GlobalNamespace/Saber.hpp"
+#include "UnityEngine/Transform.hpp"
+#include "beatsaber-hook/shared/utils/utils.h"
+#include "main.hpp"
+#include "metacore/shared/songs.hpp"
+#include "replay.hpp"
+
 using namespace GlobalNamespace;
-using namespace il2cpp_utils::il2cpp_type_check;
+using namespace UnityEngine;
 
-static bool disableObstacleEntry = false;
+// Use fully qualified types to avoid ambiguity with Sombrero aliases
+using UVec3 = UnityEngine::Vector3;
+using UQuat = UnityEngine::Quaternion;
 
-// TODO: move to utils
-static bool IsBadCut(NoteController* note, Saber* saber, Vector3 cutDirVec, float angle) {
-    bool directionOK;
-    bool speedOK;
-    bool saberTypeOK;
-    float cutDirDeviation;
-    float cutDirAngle;
-    NoteBasicCutInfoHelper::GetBasicCutInfo(
-        note->_noteTransform,
-        note->_noteData->colorType,
-        note->_noteData->cutDirection,
-        saber->saberType,
-        saber->bladeSpeedForLogic,
-        cutDirVec,
-        angle,
-        byref(directionOK),
-        byref(speedOK),
-        byref(saberTypeOK),
-        byref(cutDirDeviation),
-        byref(cutDirAngle)
-    );
-    return !directionOK || !speedOK || !saberTypeOK;
+// ─── module state ────────────────────────────────────────────────────────────
+
+static bool recording = false;
+static Replay::Data currentReplay;
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+static Replay::Transform TransformOf(Transform* t) {
+    auto pos = t->get_position();
+    auto rot = t->get_rotation();
+    return {{pos.x, pos.y, pos.z}, {rot.x, rot.y, rot.z, rot.w}};
+}
+// Convert a NoteCutInfo (Unity/game object) to our storage struct
+static Replay::Events::CutInfo CutInfoFrom(NoteCutInfo const& c) {
+    Replay::Events::CutInfo ci;
+    ci.speedOK          = c.speedOK;
+    ci.directionOK      = c.directionOK;
+    ci.saberTypeOK      = c.saberTypeOK;
+    ci.wasCutTooSoon    = c.wasCutTooSoon;
+    ci.saberSpeed       = c.saberSpeed;
+    ci.saberDir         = {c.saberDir.x, c.saberDir.y, c.saberDir.z};
+    ci.saberType        = (int) c.saberType;
+    ci.timeDeviation    = c.timeDeviation;
+    ci.cutDirDeviation  = c.cutDirDeviation;
+    ci.cutPoint         = {c.cutPoint.x, c.cutPoint.y, c.cutPoint.z};
+    ci.cutNormal        = {c.cutNormal.x, c.cutNormal.y, c.cutNormal.z};
+    ci.cutDistanceToCenter = c.cutDistanceToCenter;
+    ci.cutAngle         = c.cutAngle;
+    ci.beforeCutRating  = 0;  // filled in later by the scoring system
+    ci.afterCutRating   = 0;
+    return ci;
 }
 
-// disable real bomb cuts
-MAKE_AUTO_HOOK_MATCH(
-    BombNoteController_HandleWasCutBySaber,
-    &BombNoteController::HandleWasCutBySaber,
-    void,
-    BombNoteController* self,
-    Saber* saber,
-    UnityEngine::Vector3 cutPoint,
-    UnityEngine::Quaternion orientation,
-    UnityEngine::Vector3 cutDirVec
-) {
-    if (!Playback::DisableRealEvent(true)) {
-        if (Recorder::IsRecording()) {
-            auto zeroVec = UnityEngine::Vector3(0, 0, 0);
-            auto identityQuat = UnityEngine::Quaternion(0, 0, 0, 1);
-            NoteCutInfo cutInfo = NoteCutInfo(
-                self->_noteData, false, false, false, false,
-                saber->bladeSpeedForLogic, zeroVec,
-                saber->saberType, 0.0f, 0.0f,
-                cutPoint, UnityEngine::Vector3::get_up(),
-                0.0f, 0.0f,
-                identityQuat, identityQuat, identityQuat,
-                zeroVec, (ISaberMovementData*) saber->_movementData
-            );
-            Recorder::OnBombCut(self, cutInfo);
+static Replay::Events::NoteInfo NoteInfoFrom(NoteController* note, Replay::Events::NoteInfo::Type type) {
+    Replay::Events::NoteInfo ni;
+    auto data = note->noteData;
+    ni.scoringType  = (short)(int) data->scoringType;
+    ni.lineIndex    = (short)(int) data->lineIndex;
+    ni.lineLayer    = (short)(int) data->noteLineLayer;
+    ni.colorType    = (short)(int) data->colorType;
+    ni.cutDirection = (short)(int) data->cutDirection;
+    ni.eventType    = type;
+    return ni;
+}
+
+// ─── BSOR binary writer ───────────────────────────────────────────────────────
+// Mirrors the format documented at https://github.com/BeatLeader/BS-Open-Replay
+
+static void WriteBytes(std::ofstream& out, const void* data, size_t size) {
+    out.write(reinterpret_cast<const char*>(data), size);
+}
+
+template <typename T>
+static void Write(std::ofstream& out, T value) {
+    WriteBytes(out, &value, sizeof(T));
+}
+
+static void WriteString(std::ofstream& out, std::string const& s) {
+    int len = (int) s.size();
+    Write(out, len);
+    out.write(s.data(), len);
+}
+
+static void WriteVector3(std::ofstream& out, UVec3 v) {
+    Write(out, v.x);
+    Write(out, v.y);
+    Write(out, v.z);
+}
+
+static void WriteQuaternion(std::ofstream& out, UQuat q) {
+    Write(out, q.x);
+    Write(out, q.y);
+    Write(out, q.z);
+    Write(out, q.w);
+}
+
+static void WriteBSOR(std::ofstream& out, Replay::Data const& replay) {
+    // Magic byte + version
+    Write<uint8_t>(out, 0x49); // 'I' – BeatLeader magic
+    Write<int>(out, 1);        // section 1 = info
+
+    // --- Info section ---
+    WriteString(out, "1.0.0");          // version
+    WriteString(out, "1.40.8");         // gameVersion (kept static; change if needed)
+
+    // timestamp (unix seconds as string)
+    auto ts = std::to_string(replay.info.timestamp);
+    WriteString(out, ts);
+
+    WriteString(out, "");               // playerID  (unknown in practice)
+    // playerName as UTF-16LE length-prefixed
+    {
+        std::string const& name = replay.info.playerName.value_or("Practice");
+        int charCount = (int) name.size();
+        Write(out, charCount);
+        for (char c : name) {
+            Write<uint16_t>(out, (uint16_t)(unsigned char) c);
         }
-        BombNoteController_HandleWasCutBySaber(self, saber, cutPoint, orientation, cutDirVec);
     }
-}
+    WriteString(out, "quest");          // platform
+    WriteString(out, "quest");          // trackingSystem
+    WriteString(out, "OculusQuest");    // hmd
+    WriteString(out, "OculusTouch");    // controller
 
-// disable real note cuts
-MAKE_AUTO_HOOK_MATCH(
-    GameNoteController_HandleCut,
-    &GameNoteController::HandleCut,
-    void,
-    GameNoteController* self,
-    Saber* saber,
-    UnityEngine::Vector3 cutPoint,
-    UnityEngine::Quaternion orientation,
-    UnityEngine::Vector3 cutDirVec,
-    bool allowBadCut
-) {
-    if (!Playback::DisableRealEvent(allowBadCut && IsBadCut(self, saber, cutDirVec, self->_cutAngleTolerance))) {
-        if (Recorder::IsRecording()) {
-            // Build a NoteCutInfo so we can record it before the game processes it
-            bool dirOK, speedOK, saberTypeOK;
-            float cutDirDeviation, cutDirAngle;
-            NoteBasicCutInfoHelper::GetBasicCutInfo(
-                self->_noteTransform, self->_noteData->colorType, self->_noteData->cutDirection,
-                saber->saberType, saber->bladeSpeedForLogic, cutDirVec, self->_cutAngleTolerance,
-                byref(dirOK), byref(speedOK), byref(saberTypeOK), byref(cutDirDeviation), byref(cutDirAngle)
-            );
-            NoteCutInfo cutInfo = NoteCutInfo(
-                self->_noteData, speedOK, dirOK, saberTypeOK, false,
-                saber->bladeSpeedForLogic, cutDirVec,
-                saber->saberType,
-                self->_noteData->time - MetaCore::Internals::audioTimeSyncController->songTime,
-                cutDirDeviation, cutPoint,
-                UnityEngine::Vector3::get_up(),
-                cutDirAngle, 0.0f,
-                UnityEngine::Quaternion(0,0,0,1),
-                UnityEngine::Quaternion(0,0,0,1),
-                UnityEngine::Quaternion(0,0,0,1),
-                UnityEngine::Vector3(0,0,0),
-                (ISaberMovementData*) saber->_movementData
-            );
-            Recorder::OnNoteCut(self, cutInfo);
+    WriteString(out, replay.info.hash);
+    // songName / mapper as UTF-16LE (we don't have them at record time, use empty)
+    Write<int>(out, 0); // songName len=0
+    Write<int>(out, 0); // mapper   len=0
+
+    WriteString(out, "");               // difficulty (string form)
+
+    Write<int>(out, replay.info.score);
+    WriteString(out, "Standard");       // mode
+    WriteString(out, "");               // environment
+    WriteString(out, "");               // modifiers
+    Write<float>(out, replay.info.jumpDistance);
+    Write<bool>(out, replay.info.modifiers.leftHanded);
+    Write<float>(out, 0.0f);           // height
+
+    Write<float>(out, replay.info.startTime);
+    Write<float>(out, replay.info.failTime);
+    Write<float>(out, replay.info.speed);
+
+    // --- Poses section ---
+    Write<int>(out, 2); // section marker 2
+
+    int poseCount = (int) replay.poses.size();
+    Write<int>(out, poseCount);
+    for (auto const& pose : replay.poses) {
+        Write<float>(out, pose.time);
+        // fps stored as float in the format
+        Write<float>(out, (float) pose.fps);
+        WriteVector3(out, {pose.head.position.x, pose.head.position.y, pose.head.position.z});
+        WriteQuaternion(out, {pose.head.rotation.x, pose.head.rotation.y, pose.head.rotation.z, pose.head.rotation.w});
+        WriteVector3(out, {pose.leftHand.position.x, pose.leftHand.position.y, pose.leftHand.position.z});
+        WriteQuaternion(out, {pose.leftHand.rotation.x, pose.leftHand.rotation.y, pose.leftHand.rotation.z, pose.leftHand.rotation.w});
+        WriteVector3(out, {pose.rightHand.position.x, pose.rightHand.position.y, pose.rightHand.position.z});
+        WriteQuaternion(out, {pose.rightHand.rotation.x, pose.rightHand.rotation.y, pose.rightHand.rotation.z, pose.rightHand.rotation.w});
+    }
+
+    // --- Notes section ---
+    Write<int>(out, 3); // section marker 3
+
+    if (!replay.events.has_value()) {
+        Write<int>(out, 0);
+    } else {
+        auto const& events = replay.events.value();
+        int noteCount = (int) events.notes.size();
+        Write<int>(out, noteCount);
+        for (auto const& note : events.notes) {
+            // noteID encoding: lineIndex | (lineLayer << 3) | (colorType << 6) | (cutDirection << 8) | (scoringType << 12)
+            int noteID = (note.info.lineIndex) |
+                         (note.info.lineLayer    << 3)  |
+                         (note.info.colorType    << 6)  |
+                         (note.info.cutDirection << 8)  |
+                         (note.info.scoringType  << 12);
+            Write<int>(out, noteID);
+            Write<float>(out, note.time);         // eventTime
+            Write<float>(out, note.time);         // spawnTime (approximate; we don't track separately)
+            Write<int>(out, (int) note.info.eventType);
+
+            if (note.info.eventType == Replay::Events::NoteInfo::Type::GOOD ||
+                note.info.eventType == Replay::Events::NoteInfo::Type::BAD ||
+                note.info.eventType == Replay::Events::NoteInfo::Type::BOMB) {
+                auto const& ci = note.noteCutInfo;
+                Write<bool>(out, ci.speedOK);
+                Write<bool>(out, ci.directionOK);
+                Write<bool>(out, ci.saberTypeOK);
+                Write<bool>(out, ci.wasCutTooSoon);
+                Write<float>(out, ci.saberSpeed);
+                WriteVector3(out, {ci.saberDir.x, ci.saberDir.y, ci.saberDir.z});
+                Write<int>(out, ci.saberType);
+                Write<float>(out, ci.timeDeviation);
+                Write<float>(out, ci.cutDirDeviation);
+                WriteVector3(out, {ci.cutPoint.x, ci.cutPoint.y, ci.cutPoint.z});
+                WriteVector3(out, {ci.cutNormal.x, ci.cutNormal.y, ci.cutNormal.z});
+                Write<float>(out, ci.cutDistanceToCenter);
+                Write<float>(out, ci.cutAngle);
+                Write<float>(out, ci.beforeCutRating);
+                Write<float>(out, ci.afterCutRating);
+            }
         }
-        GameNoteController_HandleCut(self, saber, cutPoint, orientation, cutDirVec, allowBadCut);
+    }
+
+    // --- Walls section (empty) ---
+    Write<int>(out, 4); // section marker 4
+    Write<int>(out, 0); // 0 wall events
+
+    // --- Heights section (empty) ---
+    Write<int>(out, 5); // section marker 5
+    Write<int>(out, 0);
+
+    // --- Pauses section ---
+    Write<int>(out, 6); // section marker 6
+    if (!replay.events.has_value()) {
+        Write<int>(out, 0);
+    } else {
+        auto const& pauses = replay.events.value().pauses;
+        Write<int>(out, (int) pauses.size());
+        for (auto const& p : pauses) {
+            Write<long>(out, p.duration);
+            Write<float>(out, p.time);
+        }
     }
 }
 
-// disable real chain cuts
-MAKE_AUTO_HOOK_MATCH(
-    BurstSliderGameNoteController_HandleCut,
-    &BurstSliderGameNoteController::HandleCut,
-    void,
-    BurstSliderGameNoteController* self,
-    Saber* saber,
-    UnityEngine::Vector3 cutPoint,
-    UnityEngine::Quaternion orientation,
-    UnityEngine::Vector3 cutDirVec,
-    bool allowBadCut
+// ─── public API ──────────────────────────────────────────────────────────────
+
+bool Recorder::IsRecording() {
+    return recording;
+}
+
+void Recorder::OnPracticeStart(PracticeSettings* practiceSettings, std::string mapHash) {
+    if (!practiceSettings)
+        return; // not practice mode
+
+    logger.info("Recorder: starting practice capture for map {}", mapHash);
+
+    currentReplay = {};
+    currentReplay.info.hash      = mapHash;
+    currentReplay.info.practice  = true;
+    currentReplay.info.startTime = practiceSettings->startSongTime;
+    currentReplay.info.speed     = practiceSettings->songSpeedMul;
+    currentReplay.info.timestamp = (long) std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+    currentReplay.info.score     = 0;
+    currentReplay.events         = Replay::Events::Data{};
+
+    recording = true;
+}
+
+void Recorder::OnUpdate(
+    Transform* head,
+    Saber* leftSaber,
+    Saber* rightSaber,
+    float songTime,
+    int fps
 ) {
-    if (!Playback::DisableRealEvent(allowBadCut && IsBadCut(self, saber, cutDirVec, 360)))
-        BurstSliderGameNoteController_HandleCut(self, saber, cutPoint, orientation, cutDirVec, allowBadCut);
-}
-
-// disable real misses
-MAKE_AUTO_HOOK_MATCH(
-    NoteController_HandleNoteDidPassMissedMarkerEvent, &NoteController::HandleNoteDidPassMissedMarkerEvent, void, NoteController* self
-) {
-    if (!Playback::DisableRealEvent(true)) {
-        if (Recorder::IsRecording())
-            Recorder::OnNoteMiss(self);
-        NoteController_HandleNoteDidPassMissedMarkerEvent(self);
-    }
-}
-
-// disable real obstacle interactions
-MAKE_AUTO_HOOK_MATCH(
-    PlayerHeadAndObstacleInteraction_RefreshIntersectingObstacles,
-    &PlayerHeadAndObstacleInteraction::RefreshIntersectingObstacles,
-    void,
-    PlayerHeadAndObstacleInteraction* self,
-    UnityEngine::Vector3 worldPos
-) {
-    if (!Playback::DisableRealEvent(false)) {
-        disableObstacleEntry = Playback::DisableRealEvent(true);
-        PlayerHeadAndObstacleInteraction_RefreshIntersectingObstacles(self, worldPos);
-        disableObstacleEntry = false;
-    }
-}
-
-// optionally only disable entry into obstacles
-#define HashSet_Contains_MInfo                                                                     \
-    il2cpp_utils::FindMethod(                                                                      \
-        il2cpp_no_arg_class<System::Collections::Generic::HashSet_1<ObstacleController*>*>::get(), \
-        "Contains",                                                                                \
-        std::array{ il2cpp_no_arg_type<ObstacleController*>::get() }                               \
-    )
-
-MAKE_AUTO_HOOK_FIND(
-    HashSet_Contains, HashSet_Contains_MInfo, bool, System::Collections::Generic::HashSet_1<ObstacleController*>* self, ObstacleController* item
-) {
-    return disableObstacleEntry ? true : HashSet_Contains(self, item);
-}
-
-// disable resorting for replayed events
-// (regular FindMethod still doesn't work for methods with a nested generic type)
-#define ListExtensions_InsertIntoSortedListFromEnd_MInfo          \
-    il2cpp_utils::MakeGenericMethod(                              \
-        il2cpp_utils::FindMethodUnsafe(                           \
-            il2cpp_no_arg_class<ListExtensions*>::get(),          \
-            "InsertIntoSortedListFromEnd",                        \
-            2                                                     \
-        ),                                                        \
-        std::array{ il2cpp_no_arg_class<ScoringElement*>::get() } \
-    )
-
-MAKE_AUTO_HOOK_FIND(
-    ListExtensions_InsertIntoSortedListFromEnd,
-    ListExtensions_InsertIntoSortedListFromEnd_MInfo,
-    void,
-    List<ScoringElement*>* list,
-    ScoringElement* item
-) {
-    if (!Playback::DisableListSorting())
-        ListExtensions_InsertIntoSortedListFromEnd(list, item);
-    else
-        list->Add(item);
-}
-
-// ensure energy changes for obstacles are accurate
-MAKE_AUTO_HOOK_MATCH(GameEnergyCounter_LateUpdate, &GameEnergyCounter::LateUpdate, void, GameEnergyCounter* self) {
-    if (Playback::ProcessEnergy(self))
-        GameEnergyCounter_LateUpdate(self);
-}
-
-// override score
-MAKE_AUTO_HOOK_MATCH(ScoreController_LateUpdate, &ScoreController::LateUpdate, void, ScoreController* self) {
-    ScoreController_LateUpdate(self);
-    Playback::ProcessScore(self);
-}
-
-// override max score
-MAKE_AUTO_HOOK_MATCH(
-    ScoreController_DespawnScoringElement, &ScoreController::DespawnScoringElement, void, ScoreController* self, ScoringElement* scoringElement
-) {
-    // modified scores are calculated based on max scores after this function is called
-    Playback::ProcessMaxScore(self);
-    ScoreController_DespawnScoringElement(self, scoringElement);
-}
-
-// keep track of all notes
-MAKE_AUTO_HOOK_MATCH(
-    BeatmapObjectManager_AddSpawnedNoteController,
-    &BeatmapObjectManager::AddSpawnedNoteController,
-    void,
-    BeatmapObjectManager* self,
-    NoteController* noteController,
-    NoteSpawnData noteSpawnData
-) {
-    BeatmapObjectManager_AddSpawnedNoteController(self, noteController, noteSpawnData);
-    Playback::AddNoteController(noteController);
-}
-
-MAKE_AUTO_HOOK_MATCH(
-    BeatmapObjectManager_DespawnNoteController, &BeatmapObjectManager::Despawn, void, BeatmapObjectManager* self, NoteController* noteController
-) {
-    BeatmapObjectManager_DespawnNoteController(self, noteController);
-    Playback::RemoveNoteController(noteController);
-}
-
-// set modifiers on replay start
-MAKE_AUTO_HOOK_MATCH(
-    MenuTransitionsHelper_StartStandardLevel,
-    &MenuTransitionsHelper::StartStandardLevel,
-    void,
-    MenuTransitionsHelper* self,
-    StringW f1,
-    ByRef<BeatmapKey> f2,
-    BeatmapLevel* f3,
-    OverrideEnvironmentSettings* f4,
-    ColorScheme* f5,
-    bool f6,
-    ColorScheme* f7,
-    GameplayModifiers* f8,
-    PlayerSpecificSettings* f9,
-    PracticeSettings* f10,
-    EnvironmentsListModel* f11,
-    StringW f12,
-    bool f13,
-    bool f14,
-    System::Action* f15,
-    System::Action_1<Zenject::DiContainer*>* f16,
-    System::Action_2<UnityW<StandardLevelScenesTransitionSetupDataSO>, LevelCompletionResults*>* f17,
-    System::Action_2<UnityW<StandardLevelScenesTransitionSetupDataSO>, LevelCompletionResults*>* f18,
-    System::Nullable_1<RecordingToolManager::SetupData> f19
-) {
-    Playback::ProcessStart(f8, f10, f9);
-
-    // If this is a practice mode launch (not a replay), start recording
-    if (!Manager::Replaying() && f10 != nullptr) {
-        auto map = MetaCore::Songs::GetSelectedKey();
-        Recorder::OnPracticeStart(f10, (std::string) map.levelId);
-    }
-
-    MenuTransitionsHelper_StartStandardLevel(self, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19);
-}
-
-// set saber positions
-MAKE_AUTO_HOOK_MATCH(Saber_ManualUpdate, &Saber::ManualUpdate, void, Saber* self) {
-    Playback::ProcessSaber(self);
-    Saber_ManualUpdate(self);
-}
-
-// force sabers enabled in replays
-MAKE_AUTO_HOOK_MATCH(
-    DeactivateVRControllersOnFocusCapture_UpdateVRControllerActiveState,
-    &DeactivateVRControllersOnFocusCapture::UpdateVRControllerActiveState,
-    void,
-    DeactivateVRControllersOnFocusCapture* self
-) {
-    if (Manager::Replaying()) {
-        for (auto controller : self->_vrControllerGameObjects)
-            controller->active = true;
-    } else
-        DeactivateVRControllersOnFocusCapture_UpdateVRControllerActiveState(self);
-}
-
-// prevent multiplier animations while seeking
-MAKE_AUTO_HOOK_MATCH(
-    ScoreMultiplierUIController_HandleMultiplierDidChange,
-    &ScoreMultiplierUIController::HandleMultiplierDidChange,
-    void,
-    ScoreMultiplierUIController* self,
-    int multiplier,
-    float progress
-) {
-    if (Pause::AllowAnimation(self))
-        ScoreMultiplierUIController_HandleMultiplierDidChange(self, multiplier, progress);
-}
-
-// fix timing during renders
-MAKE_AUTO_HOOK_MATCH(AudioTimeSyncController_Update, &AudioTimeSyncController::Update, void, AudioTimeSyncController* self) {
-    auto state = self->_state;
-    if (!Camera::UpdateTime(self))
-        self->_state = AudioTimeSyncController::State::Stopped;
-    AudioTimeSyncController_Update(self);
-    self->_state = state;
-}
-
-// prevent replays from adding to stats
-MAKE_AUTO_HOOK_MATCH(
-    LevelCompletionResults_ctor,
-    &LevelCompletionResults::_ctor,
-    void,
-    LevelCompletionResults* self,
-    GameplayModifiers* gameplayModifiers,
-    int modifiedScore,
-    int multipliedScore,
-    RankModel::Rank rank,
-    bool fullCombo,
-    float leftSaberMovementDistance,
-    float rightSaberMovementDistance,
-    float leftHandMovementDistance,
-    float rightHandMovementDistance,
-    LevelCompletionResults::LevelEndStateType levelEndStateType,
-    LevelCompletionResults::LevelEndAction levelEndAction,
-    float energy,
-    int goodCutsCount,
-    int badCutsCount,
-    int missedCount,
-    int notGoodCount,
-    int okCount,
-    int maxCutScore,
-    int totalCutScore,
-    int goodCutsCountForNotesWithFullScoreScoringType,
-    float averageCenterDistanceCutScoreForNotesWithFullScoreScoringType,
-    float averageCutScoreForNotesWithFullScoreScoringType,
-    int maxCombo,
-    float endSongTime,
-    bool invalidated
-) {
-    if (Manager::Replaying())
-        invalidated = true;
-
-    LevelCompletionResults_ctor(
-        self,
-        gameplayModifiers,
-        modifiedScore,
-        multipliedScore,
-        rank,
-        fullCombo,
-        leftSaberMovementDistance,
-        rightSaberMovementDistance,
-        leftHandMovementDistance,
-        rightHandMovementDistance,
-        levelEndStateType,
-        levelEndAction,
-        energy,
-        goodCutsCount,
-        badCutsCount,
-        missedCount,
-        notGoodCount,
-        okCount,
-        maxCutScore,
-        totalCutScore,
-        goodCutsCountForNotesWithFullScoreScoringType,
-        averageCenterDistanceCutScoreForNotesWithFullScoreScoringType,
-        averageCutScoreForNotesWithFullScoreScoringType,
-        maxCombo,
-        endSongTime,
-        invalidated
-    );
-}
-
-// disable results view controller for replays
-MAKE_AUTO_HOOK_MATCH(
-    FlowCoordinator_PresentViewController,
-    &HMUI::FlowCoordinator::PresentViewController,
-    void,
-    HMUI::FlowCoordinator* self,
-    HMUI::ViewController* viewController,
-    System::Action* finishedCallback,
-    HMUI::ViewController::AnimationDirection animationDirection,
-    bool immediately
-) {
-    if (!Manager::CancelPresentation())
-        FlowCoordinator_PresentViewController(self, viewController, finishedCallback, animationDirection, immediately);
-}
-
-// make the replay view controller properly act like its own menu
-MAKE_AUTO_HOOK_MATCH(
-    SinglePlayerLevelSelectionFlowCoordinator_LevelSelectionFlowCoordinatorTopViewControllerWillChange,
-    &SinglePlayerLevelSelectionFlowCoordinator::LevelSelectionFlowCoordinatorTopViewControllerWillChange,
-    void,
-    SinglePlayerLevelSelectionFlowCoordinator* self,
-    HMUI::ViewController* oldViewController,
-    HMUI::ViewController* newViewController,
-    HMUI::ViewController::AnimationType animationType
-) {
-    if (newViewController->name == "ReplayMenuViewController") {
-        self->SetLeftScreenViewController(nullptr, animationType);
-        self->SetRightScreenViewController(nullptr, animationType);
-        self->SetBottomScreenViewController(nullptr, animationType);
-        self->SetTitle("REPLAY", animationType);
-        self->showBackButton = true;
+    if (!recording)
         return;
+
+    Replay::Pose pose;
+    pose.time     = songTime;
+    pose.fps      = fps;
+    pose.head     = TransformOf(head);
+    pose.leftHand = TransformOf(leftSaber->transform);
+    pose.rightHand = TransformOf(rightSaber->transform);
+
+    currentReplay.poses.push_back(pose);
+}
+
+void Recorder::OnNoteCut(NoteController* note, NoteCutInfo const& cutInfo) {
+    if (!recording || !currentReplay.events)
+        return;
+
+    bool isGood = const_cast<NoteCutInfo&>(cutInfo).get_allIsOK();
+    auto type = isGood ? Replay::Events::NoteInfo::Type::GOOD : Replay::Events::NoteInfo::Type::BAD;
+
+    Replay::Events::Note event;
+    event.info        = NoteInfoFrom(note, type);
+    event.noteCutInfo = CutInfoFrom(cutInfo);
+    event.time        = note->noteData->time;
+
+    currentReplay.events->notes.push_back(event);
+}
+
+void Recorder::OnNoteMiss(NoteController* note) {
+    if (!recording || !currentReplay.events)
+        return;
+
+    Replay::Events::Note event;
+    event.info = NoteInfoFrom(note, Replay::Events::NoteInfo::Type::MISS);
+    event.time = note->noteData->time;
+
+    currentReplay.events->notes.push_back(event);
+}
+
+void Recorder::OnBombCut(NoteController* bomb, NoteCutInfo const& cutInfo) {
+    if (!recording || !currentReplay.events)
+        return;
+
+    Replay::Events::Note event;
+    event.info        = NoteInfoFrom(bomb, Replay::Events::NoteInfo::Type::BOMB);
+    event.noteCutInfo = CutInfoFrom(cutInfo);
+    event.time        = bomb->noteData->time;
+
+    currentReplay.events->notes.push_back(event);
+}
+
+void Recorder::OnPause(float songTime) {
+    if (!recording || !currentReplay.events)
+        return;
+
+    // Store pause start time temporarily using a sentinel duration of 0
+    Replay::Events::Pause p;
+    p.time     = songTime;
+    p.duration = 0;
+    currentReplay.events->pauses.push_back(p);
+}
+
+void Recorder::OnUnpause(float songTime) {
+    if (!recording || !currentReplay.events)
+        return;
+
+    // Fill in duration for the most recent open pause
+    auto& pauses = currentReplay.events->pauses;
+    if (!pauses.empty() && pauses.back().duration == 0) {
+        long nowMs = (long) std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        // duration is stored as milliseconds of wall-clock pause time
+        // We use a rough approximation via song time delta (not perfect but fine for viewing)
+        pauses.back().duration = 1; // mark as closed; exact wall time isn't tracked here
     }
-
-    SinglePlayerLevelSelectionFlowCoordinator_LevelSelectionFlowCoordinatorTopViewControllerWillChange(
-        self, oldViewController, newViewController, animationType
-    );
 }
 
-MAKE_AUTO_HOOK_MATCH(
-    SinglePlayerLevelSelectionFlowCoordinator_BackButtonWasPressed,
-    &SinglePlayerLevelSelectionFlowCoordinator::BackButtonWasPressed,
-    void,
-    SinglePlayerLevelSelectionFlowCoordinator* self,
-    HMUI::ViewController* topViewController
-) {
-    if (topViewController->name == "ReplayMenuViewController")
-        self->DismissViewController(topViewController, HMUI::ViewController::AnimationDirection::Horizontal, nullptr, false);
-    else
-        SinglePlayerLevelSelectionFlowCoordinator_BackButtonWasPressed(self, topViewController);
-}
+void Recorder::OnLevelEnd(bool quit, bool failed, float failTime) {
+    if (!recording)
+        return;
 
-// update camera view + record poses
-MAKE_AUTO_HOOK_MATCH(PlayerTransforms_Update, &PlayerTransforms::Update, void, PlayerTransforms* self) {
-    Camera::UpdateCamera(self);
+    currentReplay.info.quit     = quit;
+    currentReplay.info.failed   = failed;
+    currentReplay.info.failTime = failTime;
 
-    if (Recorder::IsRecording() && self->_headTransform && MetaCore::Internals::audioTimeSyncController) {
-        float songTime = MetaCore::Internals::audioTimeSyncController->songTime;
-        int fps = UnityEngine::Time::get_deltaTime() > 0
-            ? (int)(1.0f / UnityEngine::Time::get_deltaTime())
-            : 60;
-
-        // Find left and right sabers
-        Saber* leftSaber = nullptr;
-        Saber* rightSaber = nullptr;
-        auto sabers = UnityEngine::Resources::FindObjectsOfTypeAll<Saber*>();
-        for (int i = 0; i < (int) sabers.size(); i++) {
-            auto s = sabers[i];
-            if (!s->isActiveAndEnabled) continue;
-            if (s->saberType == SaberType::SaberA) leftSaber  = s;
-            else if (s->saberType == SaberType::SaberB) rightSaber = s;
-        }
-
-        if (leftSaber && rightSaber)
-            Recorder::OnUpdate(self->_headTransform, leftSaber, rightSaber, songTime, fps);
-    }
-
-    PlayerTransforms_Update(self);
-}
-
-// apply wall quality without modifying the normal preset
-MAKE_AUTO_HOOK_MATCH(
-    ObstacleMaterialSetter_SetCoreMaterial,
-    &ObstacleMaterialSetter::SetCoreMaterial,
-    void,
-    ObstacleMaterialSetter* self,
-    UnityEngine::Renderer* renderer,
-    BeatSaber::Settings::QualitySettings::ObstacleQuality obstacleQuality,
-    bool screenDisplacementEffects
-) {
-    if (Manager::Rendering()) {
-        switch (getConfig().Walls.GetValue()) {
-            case 1:
-                renderer->sharedMaterial = self->_texturedCoreMaterial;
-                break;
-            case 2:
-                renderer->sharedMaterial = self->_hwCoreMaterial;
-                break;
-            default:
-                renderer->sharedMaterial = self->_lwCoreMaterial;
-                break;
-        }
-    } else
-        ObstacleMaterialSetter_SetCoreMaterial(self, renderer, obstacleQuality, screenDisplacementEffects);
-}
-
-MAKE_AUTO_HOOK_MATCH(
-    ObstacleMaterialSetter_SetFakeGlowMaterial,
-    &ObstacleMaterialSetter::SetFakeGlowMaterial,
-    void,
-    ObstacleMaterialSetter* self,
-    UnityEngine::Renderer* renderer,
-    BeatSaber::Settings::QualitySettings::ObstacleQuality obstacleQuality
-) {
-    if (Manager::Rendering())
-        renderer->sharedMaterial = getConfig().Walls.GetValue() == 0 ? self->_fakeGlowLWMaterial : self->_fakeGlowTexturedMaterial;
-    else
-        ObstacleMaterialSetter_SetFakeGlowMaterial(self, renderer, obstacleQuality);
-}
-
-// not sure why this doesn't seem to get done by setting mainEffect in SetGraphicsSettings
-MAKE_AUTO_HOOK_MATCH(ConditionalActivation_Awake, &ConditionalActivation::Awake, void, ConditionalActivation* self) {
-    if (Manager::Rendering()) {
-        if (self->name == "ObstacleFrame")
-            self->gameObject->active = getConfig().Bloom.GetValue();
-        else if (self->name == "ObstacleFakeGlow")
-            self->gameObject->active = !getConfig().Bloom.GetValue();
+    if (!quit) {
+        auto path = SaveReplay();
+        if (!path.empty())
+            logger.info("Recorder: saved practice replay to {}", path);
         else
-            ConditionalActivation_Awake(self);
-    } else
-        ConditionalActivation_Awake(self);
-}
-
-// override shockwaves too
-MAKE_AUTO_HOOK_MATCH(ShockwaveEffect_Start, &ShockwaveEffect::Start, void, ShockwaveEffect* self) {
-    ShockwaveEffect_Start(self);
-
-    if (Manager::Rendering())
-        self->_shockwavePS->main.maxParticles = getConfig().ShockwavesOn.GetValue() ? getConfig().Shockwaves.GetValue() : 0;
-}
-
-// I think graphics tweaks is what unnecessarily disables the component in addition to the game object
-MAKE_AUTO_HOOK_MATCH(ShockwaveEffect_SpawnShockwave, &ShockwaveEffect::SpawnShockwave, void, ShockwaveEffect* self, UnityEngine::Vector3 pos) {
-    if (getConfig().ShockwavesOn.GetValue() && getConfig().Shockwaves.GetValue() > 0) {
-        self->gameObject->active = true;
-        self->enabled = true;
+            logger.error("Recorder: failed to save practice replay");
     }
-    ShockwaveEffect_SpawnShockwave(self, pos);
+
+    recording = false;
 }
 
-// prevent pauses during renders
-MAKE_AUTO_HOOK_MATCH(PauseController_get_canPause, &PauseController::get_canPause, bool, PauseController* self) {
-    return Manager::Rendering() ? getConfig().Pauses.GetValue() : PauseController_get_canPause(self);
-}
+std::string Recorder::SaveReplay() {
+    // modInfo is defined in main.cpp
+    extern modloader::ModInfo modInfo;
+    static std::string replayDir = getDataDir("bl") + "replays/";
 
-// prevent replays ending in pause menu
-MAKE_AUTO_HOOK_MATCH(GameSongController_LateUpdate, &GameSongController::LateUpdate, void, GameSongController* self) {
-    if (!Manager::Paused())
-        GameSongController_LateUpdate(self);
-}
-
-// fix distortions in renders
-MAKE_HOOK_NO_CATCH(initialize_blit_fbo, 0x0, void, void* drawQuad, int conversion, int passMode) {
-    int& programId = *(int*) drawQuad;
-    if (Camera::reinitDistortions != -1) {
-        glDeleteProgram(programId);
-        programId = 0;
-        passMode = Camera::reinitDistortions;
+    if (!std::filesystem::exists(replayDir)) {
+        std::error_code ec;
+        std::filesystem::create_directories(replayDir, ec);
+        if (ec) {
+            logger.error("Recorder: failed to create replay dir {}: {}", replayDir, ec.message());
+            return "";
+        }
     }
-    Camera::reinitDistortions = -1;
 
-    if (programId != 0)
-        return;
+    // Filename: {hash}-Practice-{timestamp}.bsor
+    std::string filename = replayDir + currentReplay.info.hash + "-Practice-" +
+                           std::to_string(currentReplay.info.timestamp) + "-practice.bsor";
 
-    initialize_blit_fbo(drawQuad, conversion, passMode);
-}
+    std::ofstream out(filename, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        logger.error("Recorder: could not open {} for writing", filename);
+        return "";
+    }
 
-AUTO_HOOK_FUNCTION(blit_fbo) {
-    uintptr_t initialize_blit_fbo_addr = findPattern(
-        baseAddr("libunity.so"), "fd 7b ba a9 fc 6f 01 a9 fa 67 02 a9 f8 5f 03 a9 f6 57 04 a9 f4 4f 05 a9 ff 83 0b d1 58 d0 3b d5 08", 0x2000000
-    );
-    INSTALL_HOOK_DIRECT(logger, initialize_blit_fbo, (void*) initialize_blit_fbo_addr);
+    WriteBSOR(out, currentReplay);
+    out.close();
+
+    return filename;
 }
