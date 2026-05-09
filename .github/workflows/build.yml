@@ -45,6 +45,9 @@ jobs:
           echo libs:
           ls -la ${GITHUB_WORKSPACE}/extern/libs
 
+          - name: Clean build cache
+        run: rm -rf ${GITHUB_WORKSPACE}/build
+
       - name: Build & create qmod
         run: |
           cd ${GITHUB_WORKSPACE}
