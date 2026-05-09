@@ -82,7 +82,7 @@ MAKE_AUTO_HOOK_MATCH(
                 cutPoint, UnityEngine::Vector3::get_up(),
                 0.0f, 0.0f,
                 identityQuat, identityQuat, identityQuat,
-                zeroVec, saber->get_movementData()
+                zeroVec, (ISaberMovementData*) saber->_movementData
             );
             Recorder::OnBombCut(self, cutInfo);
         }
@@ -124,7 +124,7 @@ MAKE_AUTO_HOOK_MATCH(
                 UnityEngine::Quaternion(0,0,0,1),
                 UnityEngine::Quaternion(0,0,0,1),
                 UnityEngine::Vector3(0,0,0),
-                saber->get_movementData()
+                (ISaberMovementData*) saber->_movementData
             );
             Recorder::OnNoteCut(self, cutInfo);
         }
