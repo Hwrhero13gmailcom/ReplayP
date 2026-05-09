@@ -1,5 +1,7 @@
 #include "manager.hpp"
 
+#include <thread>
+
 #include "CustomTypes/ReplayMenu.hpp"
 #include "recorder.hpp"
 #include "GlobalNamespace/BeatmapLevelsModel.hpp"
@@ -346,7 +348,10 @@ ON_EVENT(MetaCore::Events::GameplaySceneEnded) {
         bool failed = MetaCore::Internals::health == 0 && !MetaCore::Internals::mapWasQuit;
         float failTime = failed ? (MetaCore::Internals::audioTimeSyncController
             ? MetaCore::Internals::audioTimeSyncController->songTime : 0) : -1;
-        Recorder::OnLevelEnd(MetaCore::Internals::mapWasQuit, failed, failTime);
+        bool wasQuit = MetaCore::Internals::mapWasQuit;
+        std::thread([wasQuit, failed, failTime]() {
+            Recorder::OnLevelEnd(wasQuit, failed, failTime);
+        }).detach();
     }
 
     logger.debug("replay scene ended");
