@@ -1,6 +1,7 @@
 #include "manager.hpp"
 
 #include "CustomTypes/ReplayMenu.hpp"
+#include "recorder.hpp"
 #include "GlobalNamespace/BeatmapLevelsModel.hpp"
 #include "GlobalNamespace/MenuLightsManager.hpp"
 #include "GlobalNamespace/SoloFreePlayFlowCoordinator.hpp"
@@ -283,6 +284,11 @@ ON_EVENT(MetaCore::Events::MapStarted) {
 }
 
 ON_EVENT(MetaCore::Events::MapPaused) {
+    if (Recorder::IsRecording())
+        Recorder::OnPause(MetaCore::Internals::audioTimeSyncController
+            ? MetaCore::Internals::audioTimeSyncController->songTime
+            : 0);
+
     if (!replaying)
         return;
     logger.debug("replay paused");
@@ -295,6 +301,11 @@ ON_EVENT(MetaCore::Events::MapPaused) {
 }
 
 ON_EVENT(MetaCore::Events::MapUnpaused) {
+    if (Recorder::IsRecording())
+        Recorder::OnUnpause(MetaCore::Internals::audioTimeSyncController
+            ? MetaCore::Internals::audioTimeSyncController->songTime
+            : 0);
+
     if (!replaying)
         return;
     logger.debug("replay unpaused");
@@ -329,6 +340,14 @@ ON_EVENT(MetaCore::Events::MapEnded) {
 ON_EVENT(MetaCore::Events::GameplaySceneEnded) {
     if (MetaCore::Internals::mapWasRestarted)
         return;
+
+    // Finalize practice recording if active
+    if (Recorder::IsRecording()) {
+        bool failed = MetaCore::Internals::health == 0 && !MetaCore::Internals::mapWasQuit;
+        float failTime = failed ? (MetaCore::Internals::audioTimeSyncController
+            ? MetaCore::Internals::audioTimeSyncController->songTime : 0) : -1;
+        Recorder::OnLevelEnd(MetaCore::Internals::mapWasQuit, failed, failTime);
+    }
 
     logger.debug("replay scene ended");
     auto main = MetaCore::Game::GetMainFlowCoordinator();
