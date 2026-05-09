@@ -73,11 +73,16 @@ MAKE_AUTO_HOOK_MATCH(
 ) {
     if (!Playback::DisableRealEvent(true)) {
         if (Recorder::IsRecording()) {
+            auto zeroVec = UnityEngine::Vector3(0, 0, 0);
+            auto identityQuat = UnityEngine::Quaternion(0, 0, 0, 1);
             NoteCutInfo cutInfo = NoteCutInfo(
-                self->_noteTransform, false, false, false, false,
-                saber->bladeSpeedForLogic, saber->bladeTopPos - saber->bladeBottomPos,
-                (int) saber->saberType, 0, 0, cutPoint,
-                UnityEngine::Vector3::get_up(), 0, 0, 0, 0, saber
+                self->_noteData, false, false, false, false,
+                saber->bladeSpeedForLogic, zeroVec,
+                saber->saberType, 0.0f, 0.0f,
+                cutPoint, UnityEngine::Vector3::get_up(),
+                0.0f, 0.0f,
+                identityQuat, identityQuat, identityQuat,
+                zeroVec, saber->get_movementData()
             );
             Recorder::OnBombCut(self, cutInfo);
         }
@@ -108,13 +113,18 @@ MAKE_AUTO_HOOK_MATCH(
                 byref(dirOK), byref(speedOK), byref(saberTypeOK), byref(cutDirDeviation), byref(cutDirAngle)
             );
             NoteCutInfo cutInfo = NoteCutInfo(
-                self->_noteTransform, speedOK, dirOK, saberTypeOK, false,
+                self->_noteData, speedOK, dirOK, saberTypeOK, false,
                 saber->bladeSpeedForLogic, cutDirVec,
-                (int) saber->saberType,
+                saber->saberType,
                 self->_noteData->time - MetaCore::Internals::audioTimeSyncController->songTime,
                 cutDirDeviation, cutPoint,
                 UnityEngine::Vector3::get_up(),
-                0, cutDirAngle, 0, 0, saber
+                cutDirAngle, 0.0f,
+                UnityEngine::Quaternion(0,0,0,1),
+                UnityEngine::Quaternion(0,0,0,1),
+                UnityEngine::Quaternion(0,0,0,1),
+                UnityEngine::Vector3(0,0,0),
+                saber->get_movementData()
             );
             Recorder::OnNoteCut(self, cutInfo);
         }
@@ -454,8 +464,8 @@ MAKE_AUTO_HOOK_MATCH(PlayerTransforms_Update, &PlayerTransforms::Update, void, P
         Saber* leftSaber = nullptr;
         Saber* rightSaber = nullptr;
         auto sabers = UnityEngine::Resources::FindObjectsOfTypeAll<Saber*>();
-        for (int i = 0; i < sabers->Length(); i++) {
-            auto s = sabers->get(i);
+        for (int i = 0; i < (int) sabers.size(); i++) {
+            auto s = sabers[i];
             if (!s->isActiveAndEnabled) continue;
             if (s->saberType == SaberType::SaberA) leftSaber  = s;
             else if (s->saberType == SaberType::SaberB) rightSaber = s;
